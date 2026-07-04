@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Bill Splitter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f2f5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 16px 80px;
+      color: #111;
+    }
+
+    header { text-align: center; margin-bottom: 28px; }
+    header h1 { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.5px; }
+    header p  { margin-top: 6px; color: #666; font-size: 0.95rem; }
+
+    .card {
+      background: #fff;
+      border-radius: 20px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.07);
+      padding: 28px;
+      width: 100%;
+      max-width: 560px;
+    }
+
+    /* step indicator */
+    .steps {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      margin-bottom: 24px;
+    }
+    .step-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #ddd;
+      transition: background 0.2s;
+    }
+    .step-dot.active { background: #111; }
+
+    /* section title */
+    .section-title {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #888;
+      margin-bottom: 14px;
+    }
+
+    /* upload */
+    .upload-label {
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      padding: 32px 24px;
+      border-radius: 14px;
+      border: 2px dashed #ccc;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      text-align: center;
+    }
+    .upload-label:hover { border-color: #888; background: #fafafa; }
+    .upload-label input[type="file"] { display: none; }
+    .upload-label .upload-icon { font-size: 2rem; }
+    .upload-label .upload-text { font-size: 0.95rem; color: #444; font-weight: 500; }
+    .upload-label .upload-hint { font-size: 0.78rem; color: #bbb; }
+
+    #preview {
+      display: none; width: 100%; max-height: 220px;
+      object-fit: contain; border-radius: 10px;
+      margin-top: 16px; border: 1px solid #eee;
+    }
+
+    /* buttons */
+    .btn {
+      width: 100%; padding: 13px;
+      border: none; border-radius: 12px;
+      font-size: 0.95rem; font-weight: 600;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .btn-dark  { background: #111; color: #fff; }
+    .btn-dark:hover:not(:disabled)  { background: #333; }
+    .btn-light { background: #f0f0f0; color: #333; }
+    .btn-light:hover:not(:disabled) { background: #e0e0e0; }
+    .btn:disabled { background: #ccc; color: #888; cursor: not-allowed; }
+    .btn-row { display: flex; gap: 10px; margin-top: 16px; }
+    .btn-row .btn { margin-top: 0; }
+
+    /* divider */
+    .divider { border: none; border-top: 1px solid #f0f0f0; margin: 20px 0; }
+
+    /* participant chips */
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .chip {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 12px; border-radius: 999px;
+      background: #f0f0f0; font-size: 0.85rem; font-weight: 500;
+    }
+    .chip .remove-btn {
+      background: none; border: none;
+      cursor: pointer; color: #999; font-size: 1rem; padding: 0; line-height: 1;
+    }
+    .chip .remove-btn:hover { color: #c0392b; }
+
+    /* add person row */
+    .add-row { display: flex; gap: 8px; }
+    .add-row input {
+      flex: 1; padding: 10px 14px;
+      border: 1.5px solid #ddd; border-radius: 10px;
+      font-size: 0.9rem; outline: none;
+    }
+    .add-row input:focus { border-color: #888; }
+    .add-row .btn { width: auto; padding: 10px 18px; }
+
+    /* items list */
+    .item-row {
+      padding: 12px 0;
+      border-bottom: 1px solid #f2f2f2;
+    }
+    .item-row:last-child { border-bottom: none; }
+    .item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .item-name  { font-size: 0.9rem; font-weight: 600; }
+    .item-price { font-size: 0.9rem; color: #555; }
+    .assign-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .assign-chip {
+      padding: 4px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 500;
+      border: 1.5px solid #ddd; background: #fff; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .assign-chip.selected { background: #111; color: #fff; border-color: #111; }
+    .item-split { font-size: 0.75rem; color: #aaa; margin-top: 6px; }
+
+    /* summary table */
+    .summary-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 0; border-bottom: 1px solid #f2f2f2;
+    }
+    .summary-row:last-child { border-bottom: none; }
+    .summary-name  { font-weight: 600; font-size: 0.95rem; }
+    .summary-total { font-size: 1.1rem; font-weight: 700; color: #111; }
+    .summary-sub   { font-size: 0.78rem; color: #999; margin-top: 2px; }
+
+    /* alerts */
+    .alert {
+      padding: 10px 14px; border-radius: 10px;
+      font-size: 0.85rem; margin-top: 14px;
+    }
+    .alert-warn  { background: #fffbeb; border: 1px solid #f0c040; color: #7a5c00; }
+    .alert-error { background: #fff0f0; border: 1px solid #f5c0c0; color: #c0392b; }
+
+    /* spinner */
+    .spinner {
+      display: inline-block; width: 15px; height: 15px;
+      border: 2.5px solid rgba(255,255,255,0.4); border-top-color: #fff;
+      border-radius: 50%; animation: spin 0.7s linear infinite;
+      vertical-align: middle; margin-right: 7px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .mt12 { margin-top: 12px; }
+    .mt20 { margin-top: 20px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>AI Bill Splitter</h1>
+  <p>Upload a receipt and split it with friends.</p>
+</header>
+
+<div class="card">
+  <div class="steps">
+    <div class="step-dot active" id="dot0"></div>
+    <div class="step-dot" id="dot1"></div>
+    <div class="step-dot" id="dot2"></div>
+    <div class="step-dot" id="dot3"></div>
+  </div>
+
+  <!-- STEP 0: Upload -->
+  <div id="step0">
+    <p class="section-title">Upload Receipt</p>
+    <label class="upload-label" id="uploadArea">
+      <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp" />
+      <span class="upload-icon">🧾</span>
+      <span class="upload-text">Click to upload a receipt photo</span>
+      <span class="upload-hint">JPEG · PNG · WebP &nbsp;·&nbsp; max 10 MB</span>
+    </label>
+    <img id="preview" alt="Receipt preview" />
+    <button id="analyzeBtn" class="btn btn-dark mt20" style="display:none">Analyze Receipt</button>
+    <div id="uploadError"></div>
+  </div>
+
+  <!-- STEP 1: Review parsed items + add participants -->
+  <div id="step1" style="display:none">
+    <p class="section-title">Parsed Items</p>
+    <div id="parsedItems"></div>
+
+    <hr class="divider" />
+
+    <p class="section-title">Who's Splitting?</p>
+    <div class="chips" id="participantChips"></div>
+    <div class="add-row">
+      <input type="text" id="personInput" placeholder="Enter a name" maxlength="40" />
+      <button class="btn btn-dark" id="addPersonBtn" style="width:auto;padding:10px 18px">Add</button>
+    </div>
+    <div class="btn-row mt20">
+      <button class="btn btn-light" id="backToUpload">← Back</button>
+      <button class="btn btn-dark" id="goToAssignBtn">Assign Items →</button>
+    </div>
+  </div>
+
+  <!-- STEP 2: Assign items to participants -->
+  <div id="step2" style="display:none">
+    <p class="section-title">Who ate / bought what?</p>
+    <p style="font-size:0.82rem;color:#999;margin-bottom:14px">Tap names to toggle each person's share of an item.</p>
+    <div id="assignList"></div>
+    <div class="btn-row mt20">
+      <button class="btn btn-light" id="backToParticipants">← Back</button>
+      <button class="btn btn-dark" id="goToSummaryBtn">See Summary →</button>
+    </div>
+  </div>
+
+  <!-- STEP 3: Summary -->
+  <div id="step3" style="display:none">
+    <p class="section-title">Who Owes What</p>
+    <div id="summaryList"></div>
+    <div id="unassignedWarn"></div>
+    <div class="btn-row mt20">
+      <button class="btn btn-light" id="backToAssign">← Back</button>
+      <button class="btn btn-dark" id="startOverBtn">Start Over</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────
+  let expenseId   = null;
+  let parsedItems = [];   // [{name, price, quantity}]
+  let participants = [];  // [{id, name}]
+  // itemAssignments: { itemId: Set(participantId) }
+  // (we track locally then sync to backend on summary)
+
+  // ── Helpers ───────────────────────────────────────────────────────────
+  const $  = id => document.getElementById(id);
+  const fmt = n  => "$" + Number(n).toFixed(2);
+
+  function showStep(n) {
+    [0,1,2,3].forEach(i => {
+      $("step" + i).style.display = i === n ? "block" : "none";
+      $("dot"  + i).classList.toggle("active", i === n);
+    });
+  }
+
+  // ── Step 0: Upload & Parse ─────────────────────────────────────────────
+  let selectedFile = null;
+
+  function loadFile(file) {
+    if (!file) return;
+    selectedFile = file;
+    $("preview").src = URL.createObjectURL(file);
+    $("preview").style.display = "block";
+    $("analyzeBtn").style.display = "block";
+    $("uploadError").innerHTML = "";
+  }
+
+  $("fileInput").addEventListener("change", e => loadFile(e.target.files[0]));
+
+  const ua = $("uploadArea");
+  ua.addEventListener("dragover",  e => { e.preventDefault(); ua.style.borderColor = "#555"; });
+  ua.addEventListener("dragleave", () => { ua.style.borderColor = "#ccc"; });
+  ua.addEventListener("drop", e => {
+    e.preventDefault(); ua.style.borderColor = "#ccc";
+    loadFile(e.dataTransfer.files[0]);
+  });
+
+  $("analyzeBtn").addEventListener("click", async () => {
+    if (!selectedFile) return;
+    const btn = $("analyzeBtn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Analyzing…';
+    $("uploadError").innerHTML = "";
+
+    try {
+      // 1. Parse receipt
+      const form = new FormData();
+      form.append("file", selectedFile);
+      const parseRes  = await fetch("/receipts/parse", { method: "POST", body: form });
+      const parseData = await parseRes.json();
+
+      if (!parseData.success) {
+        $("uploadError").innerHTML = `<div class="alert alert-error">⚠️ ${parseData.error}</div>`;
+        return;
+      }
+
+      const r = parseData.receipt;
+
+      // 2. Save to DB as expense
+      const expRes  = await fetch("/expenses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: selectedFile.name,
+          items: r.items,
+          subtotal: r.subtotal,
+          tax: r.tax,
+          tip: r.tip,
+          total: r.total,
+        }),
+      });
+      const expData = await expRes.json();
+
+      expenseId    = expData.id;
+      parsedItems  = expData.items;   // items now have DB ids
+      participants = expData.participants;
+
+      renderParsedItems();
+      renderParticipantChips();
+      showStep(1);
+    } catch (err) {
+      $("uploadError").innerHTML = `<div class="alert alert-error">Request failed: ${err.message}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = "Analyze Receipt";
+    }
+  });
+
+  // ── Step 1: Participants ───────────────────────────────────────────────
+  function renderParsedItems() {
+    const r = parsedItems;
+    $("parsedItems").innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:0.88rem;margin-bottom:4px">
+        <thead>
+          <tr style="background:#f8f8f8">
+            <th style="padding:7px 10px;text-align:left;color:#666;font-weight:600">Item</th>
+            <th style="padding:7px 10px;text-align:right;color:#666;font-weight:600">Price</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${r.map(item => `
+            <tr>
+              <td style="padding:7px 10px;border-bottom:1px solid #f2f2f2">${item.name}${item.quantity > 1 ? ` ×${item.quantity}` : ""}</td>
+              <td style="padding:7px 10px;border-bottom:1px solid #f2f2f2;text-align:right">${fmt(item.price)}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function renderParticipantChips() {
+    $("participantChips").innerHTML = participants.map(p => `
+      <div class="chip">
+        ${p.name}
+        <button class="remove-btn" onclick="removeParticipant('${p.id}')">×</button>
+      </div>
+    `).join("");
+  }
+
+  async function removeParticipant(pid) {
+    await fetch(`/expenses/${expenseId}/participants/${pid}`, { method: "DELETE" });
+    participants = participants.filter(p => p.id !== pid);
+    renderParticipantChips();
+  }
+
+  $("addPersonBtn").addEventListener("click", addPerson);
+  $("personInput").addEventListener("keydown", e => { if (e.key === "Enter") addPerson(); });
+
+  async function addPerson() {
+    const name = $("personInput").value.trim();
+    if (!name) return;
+    const res  = await fetch(`/expenses/${expenseId}/participants`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const p = await res.json();
+    participants.push(p);
+    $("personInput").value = "";
+    renderParticipantChips();
+  }
+
+  $("backToUpload").addEventListener("click", () => showStep(0));
+
+  $("goToAssignBtn").addEventListener("click", () => {
+    if (participants.length === 0) {
+      alert("Add at least one person before continuing.");
+      return;
+    }
+    renderAssignList();
+    showStep(2);
+  });
+
+  // ── Step 2: Assign ────────────────────────────────────────────────────
+  // Local state: itemId → Set of participant ids
+  const localAssign = {};
+
+  function renderAssignList() {
+    const container = $("assignList");
+    container.innerHTML = "";
+
+    parsedItems.forEach(item => {
+      if (!localAssign[item.id]) localAssign[item.id] = new Set();
+      const selected = localAssign[item.id];
+
+      const div = document.createElement("div");
+      div.className = "item-row";
+      div.id = "item-row-" + item.id;
+      div.innerHTML = buildItemRow(item, selected);
+      container.appendChild(div);
+    });
+  }
+
+  function buildItemRow(item, selected) {
+    const chips = participants.map(p => `
+      <span
+        class="assign-chip ${selected.has(p.id) ? "selected" : ""}"
+        onclick="toggleAssign('${item.id}', '${p.id}')"
+      >${p.name}</span>
+    `).join("");
+
+    const splitText = selected.size > 0
+      ? `${fmt(item.price / selected.size)} each (${selected.size} ${selected.size === 1 ? "person" : "people"})`
+      : "Not assigned yet";
+
+    return `
+      <div class="item-header">
+        <span class="item-name">${item.name}${item.quantity > 1 ? ` ×${item.quantity}` : ""}</span>
+        <span class="item-price">${fmt(item.price)}</span>
+      </div>
+      <div class="assign-chips">${chips}</div>
+      <div class="item-split">${splitText}</div>
+    `;
+  }
+
+  function toggleAssign(itemId, participantId) {
+    const s = localAssign[itemId];
+    s.has(participantId) ? s.delete(participantId) : s.add(participantId);
+    const item = parsedItems.find(i => i.id === itemId);
+    $("item-row-" + itemId).innerHTML = buildItemRow(item, s);
+  }
+
+  $("backToParticipants").addEventListener("click", () => showStep(1));
+
+  $("goToSummaryBtn").addEventListener("click", async () => {
+    const btn = $("goToSummaryBtn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Calculating…';
+
+    try {
+      // Sync all assignments to backend
+      await Promise.all(parsedItems.map(item =>
+        fetch(`/expenses/${expenseId}/items/${item.id}/assign`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ participant_ids: [...localAssign[item.id]] }),
+        })
+      ));
+
+      // Fetch summary
+      const res  = await fetch(`/expenses/${expenseId}/summary`);
+      const data = await res.json();
+      renderSummary(data);
+      showStep(3);
+    } catch (err) {
+      alert("Error: " + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = "See Summary →";
+    }
+  });
+
+  // ── Step 3: Summary ───────────────────────────────────────────────────
+  function renderSummary(data) {
+    $("summaryList").innerHTML = data.splits.map(s => `
+      <div class="summary-row">
+        <div>
+          <div class="summary-name">${s.name}</div>
+          <div class="summary-sub">
+            Items ${fmt(s.subtotal)}
+            ${s.tax  > 0 ? ` · Tax ${fmt(s.tax)}`  : ""}
+            ${s.tip  > 0 ? ` · Tip ${fmt(s.tip)}`  : ""}
+          </div>
+        </div>
+        <div class="summary-total">${fmt(s.total)}</div>
+      </div>
+    `).join("");
+
+    $("unassignedWarn").innerHTML = data.unassigned_items.length > 0
+      ? `<div class="alert alert-warn">⚠️ Not assigned: ${data.unassigned_items.join(", ")}</div>`
+      : "";
+  }
+
+  $("backToAssign").addEventListener("click", () => showStep(2));
+
+  $("startOverBtn").addEventListener("click", () => {
+    expenseId = null; parsedItems = []; participants = [];
+    Object.keys(localAssign).forEach(k => delete localAssign[k]);
+    $("preview").style.display = "none";
+    $("analyzeBtn").style.display = "none";
+    $("fileInput").value = "";
+    selectedFile = null;
+    showStep(0);
+  });
+</script>
+
+</body>
+</html>
