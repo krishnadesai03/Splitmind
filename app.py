@@ -8,6 +8,8 @@ import streamlit as st
 from agents.extractor import BillItem, ExtractedBill, extract
 from agents.router import route
 from agents.validator import validate
+from agents.voice_intent import parse_assignment
+from services.elevenlabs import speak
 from services.whisper import transcribe
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -23,12 +25,6 @@ st.markdown("""
 <style>
 #MainMenu, footer, header { visibility: hidden; }
 .block-container { max-width: 740px; padding-top: 2rem; padding-bottom: 5.5rem; }
-.attach-pill {
-    display: inline-flex; align-items: center; gap: 6px;
-    background: #eef2ff; border: 1px solid #c7d2fe;
-    border-radius: 999px; padding: 4px 14px;
-    font-size: 0.83rem; color: #3730a3; font-weight: 500;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -54,6 +50,13 @@ _STATE_DEFAULTS = {
     "split_step":     "names",     # "names" | "assign" | "summary"
     "participants":   [],          # list[str]
     "assignments":    {},          # {item_index: set(participant_name)}
+    # voice assignment loop (converse mode)
+    "voice_clarify_msg":     None,  # str | None — clarification line to speak/show for the current item
+    "voice_confirm_pending": None,  # str | None — confirmation line from the last successful assignment
+    "voice_attempt":         0,     # retry counter for the current item (also busts the mic widget key)
+    "voice_played_key":      None,  # last step_key whose audio was auto-played, to avoid replaying on every rerun
+    "voice_audio_cache":     {},    # {step_key: mp3 bytes} so we don't re-call ElevenLabs for the same line
+    "voice_log":             [],    # [{"role": "user"|"assistant", "text": str}] — transcript for the UI
 }
 
 for _k, _v in _STATE_DEFAULTS.items():
@@ -65,9 +68,7 @@ for _k, _v in _STATE_DEFAULTS.items():
 def _reset() -> None:
     for k in _STATE_DEFAULTS:
         st.session_state.pop(k, None)
-    # Clear input widgets so a prior recording/upload doesn't auto-reattach
-    for widget_key in ("mic", "uploader"):
-        st.session_state.pop(widget_key, None)
+    st.session_state.pop("items_editor", None)
     st.rerun()
 
 
@@ -96,12 +97,14 @@ def _save_edits(edited_df: pd.DataFrame, tax: float, tip: float, total: float) -
         name = row.get("Item", "")
         if pd.isna(name) or str(name).strip() == "":
             continue
-        qty   = row.get("Qty", 1)
-        price = row.get("Price ($)", 0.0)
+        qty        = row.get("Qty", 1)
+        qty        = max(1, int(qty) if not pd.isna(qty) else 1)
+        price_each = row.get("Price (each)", 0.0)
+        price_each = float(price_each) if not pd.isna(price_each) else 0.0
         items.append(BillItem(
             name=str(name).strip(),
-            quantity=max(1, int(qty) if not pd.isna(qty) else 1),
-            price=round(float(price) if not pd.isna(price) else 0.0, 2),
+            quantity=qty,
+            price=round(price_each * qty, 2),  # BillItem.price stays the line total everywhere else
         ))
 
     subtotal = round(sum(i.price for i in items), 2)  # price is the line total
@@ -170,6 +173,41 @@ def _calculate_splits() -> list[dict]:
     return results
 
 
+# ── Voice assignment state helpers ────────────────────────────────────────────
+def _reset_voice_state() -> None:
+    st.session_state.voice_clarify_msg     = None
+    st.session_state.voice_confirm_pending = None
+    st.session_state.voice_attempt         = 0
+    st.session_state.voice_played_key      = None
+    st.session_state.voice_audio_cache     = {}
+    st.session_state.voice_log             = []
+
+
+def _switch_to_manual() -> None:
+    st.session_state.split_mode = "type"
+    _reset_voice_state()
+    st.rerun()
+
+
+def _speak_once(step_key: str, text: str) -> None:
+    """Play `text` via ElevenLabs the first time `step_key` is seen this turn;
+    on later reruns for the same step_key, show a non-autoplaying replay control."""
+    cache = st.session_state.voice_audio_cache
+    if step_key not in cache:
+        try:
+            cache[step_key] = speak(text)
+        except Exception as exc:
+            st.warning(f"Voice playback unavailable: {exc}")
+            st.session_state.voice_played_key = step_key
+            return
+
+    if st.session_state.voice_played_key != step_key:
+        st.audio(cache[step_key], format="audio/mpeg", autoplay=True)
+        st.session_state.voice_played_key = step_key
+    else:
+        st.audio(cache[step_key], format="audio/mpeg")
+
+
 # ── Split sub-steps ───────────────────────────────────────────────────────────
 def _render_names_step() -> None:
     st.markdown("**Who's splitting this bill?**")
@@ -206,13 +244,17 @@ def _render_names_step() -> None:
             st.session_state.split_mode = "choosing"
             st.rerun()
     with next_col:
+        is_converse  = st.session_state.split_mode == "converse"
+        next_label   = "🎤 Start Voice Assignment →" if is_converse else "Assign Items →"
         if st.button(
-            "Assign Items →", type="primary", use_container_width=True,
+            next_label, type="primary", use_container_width=True,
             disabled=len(st.session_state.participants) == 0,
         ):
             # Initialise assignment sets keyed by item index
             for idx in range(len(st.session_state.extracted_bill.items)):
                 st.session_state.assignments.setdefault(idx, set())
+            if is_converse:
+                _reset_voice_state()
             st.session_state.split_step = "assign"
             st.rerun()
 
@@ -282,6 +324,134 @@ def _render_assign_step() -> None:
             st.rerun()
 
 
+def _render_converse_step() -> None:
+    bill         = st.session_state.extracted_bill
+    participants = st.session_state.participants
+    assignments  = st.session_state.assignments
+
+    pending = [i for i in range(len(bill.items)) if not assignments.get(i)]
+
+    st.markdown("**🎤 Voice assignment**")
+    st.caption("Listen to each item and speak who it should be split between.")
+
+    # ── Live-updating item list ────────────────────────────────────────────────
+    for i, item in enumerate(bill.items):
+        assigned   = assignments.get(i, set())
+        qty_tag    = f"  ×{item.quantity}" if item.quantity > 1 else ""
+        is_current = bool(pending) and i == pending[0]
+        marker     = "👉" if is_current else ("✅" if assigned else "⏳")
+
+        m_col, name_col, status_col, redo_col = st.columns([1, 5, 4, 1])
+        with m_col:
+            st.markdown(marker)
+        with name_col:
+            st.markdown(f"**{item.name}**{qty_tag}")
+        with status_col:
+            if assigned:
+                share = item.price / len(assigned)
+                st.caption(f"${share:.2f} each · {', '.join(sorted(assigned))}")
+            else:
+                st.caption(f"${item.price:.2f} · pending")
+        with redo_col:
+            if assigned and st.button("↺", key=f"redo_{i}", help="Redo this item's assignment"):
+                assignments[i] = set()
+                _reset_voice_state()
+                st.rerun()
+
+    st.divider()
+
+    # ── All items assigned ─────────────────────────────────────────────────────
+    if not pending:
+        _speak_once(
+            "all-done",
+            "All done! Here's a summary of how everything is split. "
+            "Take a look and confirm when you're ready.",
+        )
+        st.success("All items assigned! Take a look above, or tap ↺ to redo one.")
+        if st.button("See Summary →", type="primary", use_container_width=True):
+            st.session_state.split_step = "summary"
+            st.rerun()
+        if st.button("⌨️  Assign manually instead", use_container_width=True):
+            _switch_to_manual()
+        return
+
+    # ── Current item prompt ────────────────────────────────────────────────────
+    idx     = pending[0]
+    item    = bill.items[idx]
+    attempt = st.session_state.voice_attempt
+
+    if st.session_state.voice_clarify_msg:
+        message  = st.session_state.voice_clarify_msg
+        step_key = f"{idx}-clarify-{attempt}"
+    elif st.session_state.voice_confirm_pending:
+        message = (
+            f"{st.session_state.voice_confirm_pending} "
+            f"Next — {item.name}, ${item.price:.2f}. Who should this be split between?"
+        )
+        step_key = f"{idx}-prompt-confirmed"
+    else:
+        message  = f"{item.name}, ${item.price:.2f}. Who should this be split between?"
+        step_key = f"{idx}-prompt-fresh"
+
+    _speak_once(step_key, message)
+    st.info(f"🗣️ {message}")
+
+    mic_key = f"voice_mic_{idx}_{attempt}"
+    rec = st.audio_input("Speak your answer", key=mic_key)
+
+    if rec is not None:
+        with st.spinner("Listening…"):
+            try:
+                transcript = transcribe(rec.read(), "response.wav")
+            except Exception as exc:
+                st.error(f"Transcription error: {exc}")
+                transcript = ""
+
+        if not transcript:
+            st.session_state.voice_clarify_msg     = "I didn't catch that — could you say the names again?"
+            st.session_state.voice_confirm_pending = None
+            st.session_state.voice_attempt        += 1
+            st.rerun()
+
+        st.session_state.voice_log.append({"role": "user", "text": transcript})
+
+        with st.spinner("Thinking…"):
+            try:
+                intent = parse_assignment(transcript, item.name, participants)
+            except Exception as exc:
+                st.error(f"Intent parsing error: {exc}")
+                intent = None
+
+        if intent is None or intent.needs_clarification or not intent.matched_participants:
+            st.session_state.voice_clarify_msg = (
+                f"I didn't catch that — who did you mean? The participants are "
+                f"{', '.join(participants)}."
+            )
+            st.session_state.voice_confirm_pending = None
+            st.session_state.voice_attempt        += 1
+            st.rerun()
+
+        matched              = intent.matched_participants
+        assignments[idx]     = set(matched)
+        share                = item.price / len(matched)
+        confirm_line         = f"Got it — {item.name} split between {', '.join(matched)}, ${share:.2f} each."
+        st.session_state.voice_log.append({"role": "assistant", "text": confirm_line})
+        st.session_state.voice_confirm_pending = confirm_line + " Moving on."
+        st.session_state.voice_clarify_msg     = None
+        st.session_state.voice_attempt         = 0
+        st.rerun()
+
+    if st.session_state.voice_log:
+        with st.expander("Conversation so far", expanded=False):
+            for entry in st.session_state.voice_log[-8:]:
+                who = "🧑 You" if entry["role"] == "user" else "🧾 Assistant"
+                st.caption(f"**{who}:** {entry['text']}")
+
+    st.divider()
+    if st.button("⌨️  Assign manually instead", use_container_width=True):
+        _switch_to_manual()
+
+
 def _render_summary_step() -> None:
     results = _calculate_splits()
 
@@ -321,20 +491,49 @@ def _render_action_area() -> None:
     if st.session_state.edit_mode:
         bill = st.session_state.extracted_bill
         st.markdown("**Edit your bill — fix prices, rename items, or add missing rows:**")
+        st.caption("Price (each) is per-unit. \"Price (n items)\" below updates automatically with Qty.")
 
+        # The base df passed to data_editor must stay stable across reruns (always
+        # derived from the saved bill, never re-injected with pending edits) —
+        # otherwise Streamlit treats the new "default" as already matching the
+        # tracked edit and silently clears its own edit-tracking for that key,
+        # which loses the edit the next time this reruns (e.g. on Save click).
         df = pd.DataFrame([
-            {"Item": i.name, "Qty": i.quantity, "Price ($)": i.price}
+            {
+                "Item": i.name,
+                "Qty": i.quantity,
+                "Price (each)": round(i.price / i.quantity, 2) if i.quantity else i.price,
+            }
             for i in bill.items
         ])
         edited = st.data_editor(
             df, num_rows="dynamic", use_container_width=True,
             column_config={
-                "Item":      st.column_config.TextColumn("Item", required=True),
-                "Qty":       st.column_config.NumberColumn("Qty",       min_value=1,   step=1,    format="%d"),
-                "Price ($)": st.column_config.NumberColumn("Price ($)", min_value=0.0, step=0.01, format="$%.2f"),
+                "Item":         st.column_config.TextColumn("Item", required=True),
+                "Qty":          st.column_config.NumberColumn("Qty", min_value=1, step=1, format="%d"),
+                "Price (each)": st.column_config.NumberColumn("Price (each)", min_value=0.0, step=0.01, format="$%.2f"),
             },
             key="items_editor",
         )
+
+        # Derived "Price (n items)" preview — computed from `edited` (safe: this is
+        # a plain local read, not fed back into the widget's own `data` argument).
+        valid_rows = [
+            row for _, row in edited.iterrows()
+            if not (pd.isna(row.get("Item")) or str(row.get("Item", "")).strip() == "")
+        ]
+        line_totals = [
+            round(float(row.get("Qty") or 1) * float(row.get("Price (each)") or 0.0), 2)
+            for row in valid_rows
+        ]
+        if valid_rows:
+            st.dataframe(
+                pd.DataFrame({
+                    "Item": [row["Item"] for row in valid_rows],
+                    "Price (n items)": [f"${t:.2f}" for t in line_totals],
+                }),
+                use_container_width=True, hide_index=True,
+            )
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -342,11 +541,7 @@ def _render_action_area() -> None:
         with c2:
             new_tip = st.number_input("Tip ($)",  min_value=0.0, value=float(bill.tip), step=0.01, format="%.2f", key="edit_tip")
         with c3:
-            item_sum = sum(
-                float(row["Price ($)"] or 0)  # price is the line total, not unit price
-                for _, row in edited.iterrows()
-                if not pd.isna(row.get("Price ($)"))
-            )
+            item_sum  = round(sum(line_totals), 2)
             new_total = round(item_sum + new_tax + new_tip, 2)
             st.metric("Total ($)", f"${new_total:.2f}")
 
@@ -383,12 +578,15 @@ def _render_action_area() -> None:
         elif step == "summary":
             _render_summary_step()
 
-    # ── Converse placeholder ──────────────────────────────────────────────────
+    # ── Converse flow ─────────────────────────────────────────────────────────
     elif st.session_state.split_mode == "converse":
-        st.info("🎤 Voice assignment agent coming in the next phase!")
-        if st.button("← Back", use_container_width=False):
-            st.session_state.split_mode = "choosing"
-            st.rerun()
+        step = st.session_state.split_step
+        if step == "names":
+            _render_names_step()
+        elif step == "assign":
+            _render_converse_step()
+        elif step == "summary":
+            _render_summary_step()
 
     # ── Default: main action buttons ──────────────────────────────────────────
     else:
@@ -396,6 +594,7 @@ def _render_action_area() -> None:
         with col_edit:
             if st.button("✏️  Need more edits?", use_container_width=True):
                 st.session_state.edit_mode = True
+                st.session_state.pop("items_editor", None)
                 st.rerun()
         with col_split:
             if st.button("✅  Ready to Split it?", type="primary", use_container_width=True):
@@ -440,6 +639,8 @@ def _submit(text: str | None) -> None:
     st.session_state.split_step    = "names"
     st.session_state.participants  = []
     st.session_state.assignments   = {}
+    st.session_state.pop("items_editor", None)
+    _reset_voice_state()
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -543,6 +744,7 @@ if st.session_state.pending_input:
                             state="error", expanded=True,
                         )
                         st.session_state.edit_mode = True
+                        st.session_state.pop("items_editor", None)
                 except Exception as exc:
                     s.update(label=f"Validation error: {exc}", state="error", expanded=True)
 
@@ -590,57 +792,30 @@ if st.session_state.extracted_bill and not st.session_state.pending_input:
 
 # ── Input controls (hidden once a bill is submitted) ──────────────────────────
 if not st.session_state.extracted_bill and not st.session_state.pending_input:
-    c_att, c_mic, _ = st.columns([1.6, 1.6, 6.8])
+    chat_val = st.chat_input(
+        "Type items, paste a bill, attach a receipt, or record your voice…",
+        accept_file=True,
+        file_type=["jpg", "jpeg", "png", "pdf"],
+        max_upload_size=10,
+        accept_audio=True,
+    )
 
-    with c_att:
-        with st.popover("📎  Attach", use_container_width=True):
-            st.caption("PNG · JPG · PDF — max 10 MB")
-            up = st.file_uploader(
-                "file", type=["jpg", "jpeg", "png", "pdf"],
-                label_visibility="collapsed", key="uploader",
-            )
-            if up is not None:
-                raw = up.read()
-                if len(raw) > 10 * 1024 * 1024:
-                    st.error("File exceeds the 10 MB limit.")
-                else:
-                    st.session_state.file_bytes = raw
-                    st.session_state.file_name  = up.name
-                    st.session_state.file_type  = up.type
-                    st.success(f"✓  {up.name} — ready to send")
+    if chat_val:
+        text       = chat_val.text.strip() if chat_val.text else None
+        file_bytes = file_name = file_type = None
 
-    with c_mic:
-        with st.popover("🎤  Voice", use_container_width=True):
-            st.caption("Record your bill, then send")
-            rec = st.audio_input("Record", label_visibility="collapsed", key="mic")
-            if rec is not None:
-                st.session_state.file_bytes = rec.read()
-                st.session_state.file_name  = "voice-note.wav"
-                st.session_state.file_type  = "audio/wav"
+        if chat_val.files:
+            up = chat_val.files[0]
+            file_bytes = up.read()
+            file_name  = up.name
+            file_type  = up.type
+        elif chat_val.audio:
+            file_bytes = chat_val.audio.read()
+            file_name  = "voice-note.wav"
+            file_type  = "audio/wav"
 
-    if st.session_state.file_name:
-        _is_audio   = (st.session_state.file_type or "").startswith("audio/")
-        _pill_icon  = "🎤" if _is_audio else "📎"
-        _pill_label = "Voice note" if _is_audio else st.session_state.file_name
-        _send_label = "📤  Send recording" if _is_audio else "📤  Send receipt"
-
-        pill_col, clr_col = st.columns([11, 1])
-        with pill_col:
-            st.markdown(
-                f'<span class="attach-pill">{_pill_icon}&nbsp; {_pill_label}</span>',
-                unsafe_allow_html=True,
-            )
-        with clr_col:
-            if st.button("✕", key="rm_attach", help="Remove attachment"):
-                st.session_state.file_bytes = None
-                st.session_state.file_name  = None
-                st.session_state.file_type  = None
-                st.session_state.pop("mic", None)
-                st.rerun()
-        if st.button(_send_label, type="primary", key="send_file", use_container_width=True):
-            _submit(None)
-            st.rerun()
-
-    if prompt := st.chat_input("Type items, paste a bill, or use 📎 above to attach a receipt…"):
-        _submit(prompt)
+        st.session_state.file_bytes = file_bytes
+        st.session_state.file_name  = file_name
+        st.session_state.file_type  = file_type
+        _submit(text)
         st.rerun()

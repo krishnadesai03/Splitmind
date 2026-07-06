@@ -7,21 +7,24 @@ Classifies every user submission into one of three routes:
   - text_pipeline                (typed text or URL)
 
 File inputs are routed by MIME type (no LLM needed — deterministic).
-Text inputs use a lightweight Haiku call to detect URLs.
+Text inputs use a lightweight gpt-4o-mini call to detect URLs.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Literal
 
-import anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
 InputType = Literal["image", "pdf", "audio", "text", "url"]
 RouteName  = Literal["vision_pipeline", "whisper_then_text_pipeline", "text_pipeline"]
+
+_TEXT_MODEL = "gpt-4o-mini"
 
 
 @dataclass
@@ -31,11 +34,11 @@ class RouteDecision:
     status_label: str  # shown in the UI status indicator
 
 
-# ── Tool definition for text classification ───────────────────────────────────
-_CLASSIFY_TOOL = {
+# ── Structured Outputs schema for text classification ────────────────────────
+_CLASSIFY_SCHEMA = {
     "name": "classify_text_input",
-    "description": "Classify a text input as either a URL (to fetch) or plain bill text.",
-    "input_schema": {
+    "strict": True,
+    "schema": {
         "type": "object",
         "properties": {
             "contains_url": {
@@ -48,6 +51,7 @@ _CLASSIFY_TOOL = {
             },
         },
         "required": ["contains_url", "url"],
+        "additionalProperties": False,
     },
 }
 
@@ -94,22 +98,21 @@ def route(
         # Unknown file type — fall through to text pipeline
         return RouteDecision("text", "text_pipeline", "📝 Unknown file type → text pipeline")
 
-    # ── Text input: lightweight Claude call to detect URLs ────────────────────
+    # ── Text input: lightweight OpenAI call to detect URLs ────────────────────
     if text:
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        response = client.chat.completions.create(
+            model=_TEXT_MODEL,
             max_tokens=128,
-            tools=[_CLASSIFY_TOOL],
-            tool_choice={"type": "tool", "name": "classify_text_input"},
+            response_format={"type": "json_schema", "json_schema": _CLASSIFY_SCHEMA},
             messages=[{
                 "role": "user",
                 "content": f"Classify this input:\n\n{text[:500]}",
             }],
         )
 
-        data = next(b for b in response.content if b.type == "tool_use").input
+        data = json.loads(response.choices[0].message.content)
 
         if data.get("contains_url"):
             return RouteDecision(

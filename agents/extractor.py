@@ -1,9 +1,10 @@
 """
 agents/extractor.py — Agent 1: Item Extractor
 
-Two extraction paths, both using Claude tool use for guaranteed structured output:
-  - Vision path  : claude-sonnet-4-6 + image/PDF bytes  (for file attachments)
-  - Text path    : claude-sonnet-4-6 + plain text        (for typed/pasted bills)
+Two extraction paths, both using OpenAI Structured Outputs for guaranteed
+JSON-schema-conformant output:
+  - Vision path  : gpt-4o + image/PDF bytes  (for file attachments)
+  - Text path    : gpt-4o-mini + plain text  (for typed/pasted bills)
 
 Both prompts use chain-of-thought: identify receipt type → list every item →
 find subtotal / tax / tip / total.
@@ -11,13 +12,17 @@ find subtotal / tax / tip / total.
 from __future__ import annotations
 
 import base64
+import json
 import os
 from dataclasses import dataclass
 
-import anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
+
+_VISION_MODEL = "gpt-4o"
+_TEXT_MODEL   = "gpt-4o-mini"
 
 # ── Output types ──────────────────────────────────────────────────────────────
 
@@ -39,15 +44,12 @@ class ExtractedBill:
     validation_note:   str | None = None
 
 
-# ── Shared tool definition ────────────────────────────────────────────────────
+# ── Shared Structured Outputs schema ──────────────────────────────────────────
 
-_PARSE_TOOL = {
+_PARSE_SCHEMA = {
     "name": "parse_bill",
-    "description": (
-        "Extract all line items, prices, tax, tip, and total from a bill or receipt. "
-        "Do NOT include tax or tip as line items."
-    ),
-    "input_schema": {
+    "strict": True,
+    "schema": {
         "type": "object",
         "properties": {
             "items": {
@@ -61,6 +63,7 @@ _PARSE_TOOL = {
                         "quantity": {"type": "integer", "description": "Quantity ordered, default 1"},
                     },
                     "required": ["name", "price", "quantity"],
+                    "additionalProperties": False,
                 },
             },
             "subtotal": {"type": "number", "description": "Sum of all item prices before tax/tip"},
@@ -69,11 +72,12 @@ _PARSE_TOOL = {
             "total":    {"type": "number", "description": "Final total as shown on the bill"},
         },
         "required": ["items", "subtotal", "tax", "tip", "total"],
+        "additionalProperties": False,
     },
 }
 
 _COT_SUFFIX = (
-    "\n\nThink step by step before calling the tool:\n"
+    "\n\nThink step by step before producing the JSON:\n"
     "1. What type of bill/receipt is this?\n"
     "2. List every line item with its name, price, and quantity.\n"
     "3. Identify the subtotal, tax, tip, and final total separately.\n"
@@ -84,25 +88,35 @@ _COT_SUFFIX = (
 # ── Vision path ───────────────────────────────────────────────────────────────
 
 def _extract_from_image(file_bytes: bytes, file_type: str, correction: str | None = None) -> ExtractedBill:
-    client     = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    image_data = base64.standard_b64encode(file_bytes).decode()
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    b64    = base64.standard_b64encode(file_bytes).decode()
 
     base_text = "Parse this receipt and extract all items, prices, tax, tip, and total." + _COT_SUFFIX
     if correction:
         base_text += f"\n\nCorrection needed: {correction}"
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
+    if file_type == "application/pdf":
+        file_part = {
+            "type": "file",
+            "file": {
+                "filename": "receipt.pdf",
+                "file_data": f"data:application/pdf;base64,{b64}",
+            },
+        }
+    else:
+        file_part = {
+            "type": "image_url",
+            "image_url": {"url": f"data:{file_type};base64,{b64}"},
+        }
+
+    response = client.chat.completions.create(
+        model=_VISION_MODEL,
         max_tokens=1024,
-        tools=[_PARSE_TOOL],
-        tool_choice={"type": "tool", "name": "parse_bill"},
+        response_format={"type": "json_schema", "json_schema": _PARSE_SCHEMA},
         messages=[{
             "role": "user",
             "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": file_type, "data": image_data},
-                },
+                file_part,
                 {"type": "text", "text": base_text},
             ],
         }],
@@ -113,13 +127,13 @@ def _extract_from_image(file_bytes: bytes, file_type: str, correction: str | Non
 # ── Text path ─────────────────────────────────────────────────────────────────
 
 def _extract_from_text(text: str, correction: str | None = None) -> ExtractedBill:
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     correction_block = f"\n\nCorrection from previous attempt: {correction}" if correction else ""
 
     prompt = (
         "Extract all items and financial totals from the bill description below.\n\n"
-        "Fill in the parse_bill tool with:\n"
+        "Return JSON with:\n"
         "- items: every purchased item (food, drinks, products, services). "
         "Do NOT include tax or tip here.\n"
         "- subtotal: sum of all item prices\n"
@@ -131,11 +145,10 @@ def _extract_from_text(text: str, correction: str | None = None) -> ExtractedBil
         f"Bill:\n{text}"
     )
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
+    response = client.chat.completions.create(
+        model=_TEXT_MODEL,
         max_tokens=1024,
-        tools=[_PARSE_TOOL],
-        tool_choice={"type": "tool", "name": "parse_bill"},
+        response_format={"type": "json_schema", "json_schema": _PARSE_SCHEMA},
         messages=[{"role": "user", "content": prompt}],
     )
     return _build_result(response)
@@ -143,9 +156,8 @@ def _extract_from_text(text: str, correction: str | None = None) -> ExtractedBil
 
 # ── Shared result builder ─────────────────────────────────────────────────────
 
-def _build_result(response: anthropic.types.Message) -> ExtractedBill:
-    tool_block = next(b for b in response.content if b.type == "tool_use")
-    data       = tool_block.input
+def _build_result(response) -> ExtractedBill:
+    data = json.loads(response.choices[0].message.content)
 
     items    = [BillItem(**item) for item in data.get("items", [])]
     subtotal = round(float(data.get("subtotal", 0)), 2)
